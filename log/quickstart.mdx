@@ -39,15 +39,15 @@ curl -X POST http://localhost:8081/api/v1/log/append \
   -d '{
     "records": [
       {
-        "key": { "value": "b3JkZXJz" },
+        "key": "b3JkZXJz",
         "value": "eyJpdGVtIjoid2lkZ2V0IiwicXR5IjozLCJwcmljZSI6OS45OX0="
       },
       {
-        "key": { "value": "b3JkZXJz" },
+        "key": "b3JkZXJz",
         "value": "eyJpdGVtIjoiZ2FkZ2V0IiwicXR5IjoxLCJwcmljZSI6MjQuOTV9"
       },
       {
-        "key": { "value": "b3JkZXJz" },
+        "key": "b3JkZXJz",
         "value": "eyJpdGVtIjoid2lkZ2V0IiwicXR5IjoxMCwicHJpY2UiOjkuOTl9"
       }
     ]
@@ -88,7 +88,7 @@ value:
 ```json
 {
   "status": "success",
-  "key": { "value": "b3JkZXJz" },
+  "key": "b3JkZXJz",
   "values": [
     { "sequence": 0, "value": "eyJpdGVtIjoid2lkZ2V0IiwicXR5IjozLCJwcmljZSI6OS45OX0=" },
     { "sequence": 1, "value": "eyJpdGVtIjoiZ2FkZ2V0IiwicXR5IjoxLCJwcmljZSI6MjQuOTV9" },

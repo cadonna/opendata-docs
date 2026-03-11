@@ -1,0 +1,427 @@
+---
+title: Getting to Production
+description: Deploy, monitor, and secure Timeseries on Kubernetes with S3 storage
+---
+
+This guide covers everything you need to run Timeseries in production on
+Kubernetes: a complete Helm chart, S3-backed storage with a local disk cache,
+health checks, monitoring, and security.
+
+## Deployment
+
+### Overview
+
+Since we haven't yet built partitioning into Timeseries, a production
+ Timeseries deployment consists of a single replica only. The primary means of scaling 
+ would be scaling up, which can take you pretty far. Since all data is persisted on S3, 
+ data in a single node Timeseries is highly durable.
+
+So, a production deployment of Timeseries consists of: 
+
+- A **single-replica Deployment** running the `opendata-timeseries` container
+- An **S3 bucket** for durable data storage
+- A **PersistentVolumeClaim** backed by a fast SSD for the SlateDB disk cache
+- A **ConfigMap** for the Prometheus-compatible scrape configuration, S3 storage
+  settings, and SlateDB tuning
+- A **ServiceAccount** with an IAM role for S3 access (IRSA on EKS)
+
+<Note>
+  Timeseries uses SlateDB's epoch-based fencing, which means only one writer can
+  hold the epoch lock at a time. The Deployment uses the `Recreate` strategy so
+  that the old pod is fully terminated before the new one starts — a
+  `RollingUpdate` creates the possibility for the new pod to be fenced by the old one and never
+  become ready.
+</Note>
+
+### Helm chart
+
+Below is a complete Helm chart for deploying Timeseries to production. Create
+these files under `charts/opendata-timeseries/`.
+
+#### `values.yaml`
+
+```yaml values.yaml
+image:
+  repository: ghcr.io/opendata-oss/timeseries
+  tag: "0.1.8"
+
+port: 9090
+
+# S3 storage configuration
+s3:
+  bucket: my-timeseries-bucket
+  region: us-west-2
+  prefix: timeseries
+
+# SlateDB disk cache — use a fast SSD-backed StorageClass
+cache:
+  size: 100Gi
+  storageClassName: gp3
+  maxCacheSizeBytes: 107374182400  # 100 GB
+
+# SlateDB tuning
+slatedb:
+  defaultTtl: 604800000          # 7 days data retention
+  maxUnflushedBytes: 134217728   # 128 MB
+  l0SstSizeBytes: 16777216       # 16 MB
+  maxSstSize: 67108864           # 64 MB
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# IRSA role ARN for S3 access
+serviceAccount:
+  roleArn: ""
+
+# Scrape configuration (prometheus.yaml format)
+scrapeConfig: |
+  global:
+    scrape_interval: 30s
+  scrape_configs:
+    - job_name: "timeseries-self"
+      scrape_interval: 15s
+      static_configs:
+        - targets: ["localhost:9090"]
+```
+
+#### `templates/configmap.yaml`
+
+```yaml templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+data:
+  prometheus.yaml: |
+    {{ .Values.scrapeConfig | nindent 4 }}
+    storage:
+      type: SlateDb
+      path: {{ .Values.s3.prefix }}
+      object_store:
+        type: Aws
+        region: {{ .Values.s3.region }}
+        bucket: {{ .Values.s3.bucket }}
+      settings_path: /slatedb-settings/slatedb.yaml
+
+  slatedb.yaml: |
+    default_ttl: {{ int .Values.slatedb.defaultTtl }}
+    max_unflushed_bytes: {{ int .Values.slatedb.maxUnflushedBytes }}
+    l0_sst_size_bytes: {{ int .Values.slatedb.l0SstSizeBytes }}
+    compactor_options:
+      max_concurrent_compactions: 2
+      max_sst_size: {{ int .Values.slatedb.maxSstSize }}
+    garbage_collector_options:
+      manifest_options:
+        interval: '60s'
+        min_age: '3600s'
+      wal_options:
+        interval: '60s'
+        min_age: '60s'
+      compacted_options:
+        interval: '60s'
+        min_age: '3600s'
+      compactions_options:
+        interval: '60s'
+        min_age: '3600s'
+    object_store_cache_options:
+      root_folder: /cache
+      max_cache_size_bytes: {{ int .Values.cache.maxCacheSizeBytes }}
+```
+
+#### `templates/serviceaccount.yaml`
+
+```yaml templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}
+  annotations:
+    eks.amazonaws.com/role-arn: {{ .Values.serviceAccount.roleArn }}
+```
+
+#### `templates/pvc.yaml`
+
+```yaml templates/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-cache
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.cache.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.cache.size }}
+```
+
+#### `templates/deployment.yaml`
+
+```yaml templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: timeseries
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          args:
+            - "--config"
+            - "/config/prometheus.yaml"
+            - "--port"
+            - "{{ .Values.port }}"
+          ports:
+            - containerPort: {{ .Values.port }}
+              name: http
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: slatedb-settings
+              mountPath: /slatedb-settings
+              readOnly: true
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+            items:
+              - key: prometheus.yaml
+                path: prometheus.yaml
+        - name: slatedb-settings
+          configMap:
+            name: {{ .Release.Name }}-config
+            items:
+              - key: slatedb.yaml
+                path: slatedb.yaml
+        - name: cache
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-cache
+```
+
+#### `templates/service.yaml`
+
+```yaml templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+    - port: {{ .Values.port }}
+      targetPort: http
+      name: http
+```
+
+#### Install the chart
+
+```bash
+helm install opendata-timeseries ./charts/opendata-timeseries \
+  --set s3.bucket=my-timeseries-bucket \
+  --set s3.region=us-west-2 \
+  --set serviceAccount.roleArn=arn:aws:iam::123456789012:role/opendata-timeseries
+```
+
+### Disk cache
+
+SlateDB caches frequently accessed data on local disk to avoid repeated reads
+from S3. For production workloads, use an SSD-backed StorageClass:
+
+- **EKS**: Use `gp3` (General Purpose SSD) or `io2` for higher IOPS. For
+  maximum performance, use instance-store NVMe volumes with a
+  [local-static-provisioner](https://github.com/kubernetes-sigs/sig-storage-local-static-provisioner).
+- Size the cache based on your active working set. The default of **100 Gi** is a
+  good starting point; increase if you see frequent cache evictions in the
+  `slatedb_*` metrics.
+
+<Warning>
+  Avoid using HDD-backed volumes (e.g. `st1`, `sc1`) for the cache. SlateDB
+  issues many small random reads, and spinning disks will bottleneck performance.
+</Warning>
+
+### Health checks
+
+Timeseries exposes two health-check endpoints:
+
+| Endpoint | Type | Behavior |
+| --- | --- | --- |
+| `/-/healthy` | Liveness | Returns 200 if the process is running |
+| `/-/ready` | Readiness | Returns 200 once the TSDB is initialized and ready to serve queries |
+
+Both probes are included in the Helm chart's Deployment template above.
+
+### Graceful shutdown
+
+Timeseries handles `SIGTERM` and `SIGINT` signals gracefully:
+
+1. Stops accepting new connections
+2. Drains in-flight requests
+3. Flushes TSDB data from memory to durable storage
+4. Exits cleanly
+
+The Helm chart sets `terminationGracePeriodSeconds: 60` to give the server enough
+time to complete the flush before Kubernetes force-kills the pod.
+
+## Monitoring
+
+All metrics are exposed at `/metrics` in Prometheus text format. Since Timeseries
+is itself a Prometheus-compatible data source, you can configure it to scrape its
+own metrics endpoint (included in the default `scrapeConfig` above).
+
+### Key metrics
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `scrape_samples_scraped` | counter | `job`, `instance` | Number of samples scraped per target |
+| `scrape_samples_failed` | counter | `job`, `instance` | Number of samples that failed validation |
+| `remote_write_samples_ingested_total` | counter | — | Total samples ingested via remote write |
+| `remote_write_samples_failed_total` | counter | — | Total samples that failed remote write ingestion |
+| `http_requests_total` | counter | `method`, `endpoint`, `status` | Total HTTP requests handled |
+| `http_request_duration_seconds` | histogram | `method`, `endpoint` | Request latency distribution |
+| `http_requests_in_flight` | gauge | — | Number of HTTP requests currently being served |
+
+<Note>
+  Timeseries also exposes `slatedb_*` metrics from the underlying SlateDB storage
+  engine. These are useful for debugging storage-level performance and compaction
+  behavior. 
+</Note>
+
+### Example PromQL queries
+
+```promql
+# Request rate (requests per second over 5 minutes)
+rate(http_requests_total[5m])
+
+# Error rate (5xx responses)
+rate(http_requests_total{status=~"5.."}[5m])
+
+# p99 request latency
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+# In-flight requests
+http_requests_in_flight
+
+# Sample ingestion rate (remote write)
+rate(remote_write_samples_ingested_total[5m])
+
+# Scrape sample throughput
+rate(scrape_samples_scraped[5m])
+```
+
+
+## Security
+
+### TLS and authentication
+
+<Warning>
+  Timeseries does not include built-in TLS termination or authentication. Place a
+  reverse proxy (nginx, Envoy, or a cloud load balancer) in front of Timeseries
+  to handle TLS and access control.
+</Warning>
+
+### Object storage security
+
+The Helm chart uses [IRSA](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)
+(IAM Roles for Service Accounts) so that the pod receives temporary AWS
+credentials automatically — no static access keys required.
+
+Create an IAM role with the following policy and attach it to the ServiceAccount
+via the `serviceAccount.roleArn` value:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-timeseries-bucket",
+        "arn:aws:s3:::my-timeseries-bucket/*"
+      ]
+    }
+  ]
+}
+```
+
+The IAM role's trust policy should scope access to your EKS cluster's OIDC
+provider and the specific service account:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-west-2.amazonaws.com/id/EXAMPLE"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.us-west-2.amazonaws.com/id/EXAMPLE:aud": "sts.amazonaws.com",
+          "oidc.eks.us-west-2.amazonaws.com/id/EXAMPLE:sub": "system:serviceaccount:default:opendata-timeseries"
+        }
+      }
+    }
+  ]
+}
+```
+
+Additional recommendations:
+
+- Enable **encryption at rest** on the S3 bucket (SSE-S3 or SSE-KMS).
+- Use a **VPC endpoint** for S3 to keep traffic off the public internet.
+- Block all public access on the bucket.
+- Add a **lifecycle rule** to transition old data to Intelligent-Tiering after 30
+  days and abort incomplete multipart uploads after 7 days.
