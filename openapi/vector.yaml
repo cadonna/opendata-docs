@@ -1,0 +1,397 @@
+openapi: 3.1.0
+info:
+  title: OpenData Vector API
+  version: 1.0.0
+  description: HTTP API for the OpenData Vector service — a semantic search database on object storage.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /api/v1/vector/write:
+    post:
+      operationId: write
+      summary: Upsert vectors
+      description: |
+        Upsert one or more vectors into the collection. Each vector has a
+        user-provided string ID (up to 64 bytes), a dense embedding in the
+        `vector` attribute, and optional metadata attributes.
+
+        If a vector with the same ID already exists, it is replaced.
+
+        Supports both binary protobuf (`application/protobuf`) and ProtoJSON
+        (`application/protobuf+json`) request bodies.
+      requestBody:
+        required: true
+        content:
+          application/protobuf+json:
+            schema:
+              $ref: "#/components/schemas/WriteRequest"
+            example:
+              upsertVectors:
+                - id: "doc-1"
+                  attributes:
+                    vector: [1.0, 2.0, 3.0]
+                    category: "electronics"
+                    department: "hw"
+                - id: "doc-2"
+                  attributes:
+                    vector: [4.0, 5.0, 6.0]
+                    category: "books"
+          application/protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Vectors upserted successfully.
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/UpsertVectorsResponse"
+              example:
+                status: success
+                vectorsUpserted: 2
+        "400":
+          description: Invalid input (malformed body, missing ID, missing vector, type mismatch).
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/vector/search:
+    post:
+      operationId: search
+      summary: Search for nearest neighbors
+      description: |
+        Find the `k` nearest vectors to a given query vector. Optionally filter
+        results by metadata attributes using a filter expression.
+
+        The `nprobe` parameter controls how many posting lists are searched.
+        Higher values improve recall at the cost of latency.
+
+        The `includeFields` parameter controls which attributes are returned
+        for each result. When omitted, all attributes are returned.
+
+        Supports both binary protobuf (`application/protobuf`) and ProtoJSON
+        (`application/protobuf+json`) request bodies.
+      requestBody:
+        required: true
+        content:
+          application/protobuf+json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+            example:
+              vector: [1.0, 2.0, 3.0]
+              k: 10
+              nprobe: 20
+              filter:
+                eq:
+                  field: "category"
+                  value: "electronics"
+          application/protobuf:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Search results ranked by similarity.
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+              example:
+                status: success
+                results:
+                  - score: 0.05
+                    vector:
+                      id: "doc-1"
+                      attributes:
+                        vector: [1.0, 2.0, 3.0]
+                        category: "electronics"
+        "400":
+          description: Invalid input (empty vector, k is 0, malformed filter).
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/vector/vectors/{id}:
+    get:
+      operationId: getVector
+      summary: Get a vector by ID
+      description: |
+        Retrieve a single vector and its attributes by its user-provided ID.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The user-provided vector ID.
+          schema:
+            type: string
+            maxLength: 64
+      responses:
+        "200":
+          description: The requested vector.
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/GetVectorResponse"
+              example:
+                status: success
+                vector:
+                  id: "doc-1"
+                  attributes:
+                    vector: [1.0, 2.0, 3.0]
+                    category: "electronics"
+        "404":
+          description: Vector not found.
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                status: error
+                message: "Document 'doc-1' not found"
+        "400":
+          description: Invalid input.
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/protobuf+json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    AttributeValue:
+      description: |
+        A metadata attribute value. In JSON, values are represented as plain
+        scalars or arrays — strings, integers, floats, booleans, or arrays of
+        floats (for the vector field).
+      oneOf:
+        - type: string
+          description: String attribute value.
+        - type: integer
+          format: int64
+          description: 64-bit signed integer attribute value.
+        - type: number
+          format: double
+          description: 64-bit floating point attribute value.
+        - type: boolean
+          description: Boolean attribute value.
+        - type: array
+          items:
+            type: number
+            format: float
+          description: Vector attribute (array of f32 values). Used for the reserved `vector` field.
+
+    Attributes:
+      type: object
+      description: |
+        A flat map of attribute names to values. Must include a `vector` key
+        with an array of floats matching the collection's configured dimensions.
+        Other keys are metadata attributes whose types must match the collection
+        schema (if defined).
+      additionalProperties:
+        $ref: "#/components/schemas/AttributeValue"
+      required:
+        - vector
+
+    Vector:
+      type: object
+      description: A record with an ID and attributes, including the embedding vector.
+      properties:
+        id:
+          type: string
+          maxLength: 64
+          description: User-provided unique identifier (up to 64 bytes).
+        attributes:
+          $ref: "#/components/schemas/Attributes"
+      required:
+        - id
+        - attributes
+
+    WriteRequest:
+      type: object
+      description: Request body for upserting vectors.
+      properties:
+        upsertVectors:
+          type: array
+          items:
+            $ref: "#/components/schemas/Vector"
+          description: One or more vectors to upsert.
+      required:
+        - upsertVectors
+
+    UpsertVectorsResponse:
+      type: object
+      description: Response after successfully upserting vectors.
+      properties:
+        status:
+          type: string
+          example: success
+        vectorsUpserted:
+          type: integer
+          format: int32
+          description: Number of vectors upserted.
+      required:
+        - status
+        - vectorsUpserted
+
+    ComparisonFilter:
+      type: object
+      description: Filter that compares a field to a scalar value.
+      properties:
+        field:
+          type: string
+          description: The attribute field name to compare.
+        value:
+          $ref: "#/components/schemas/AttributeValue"
+      required:
+        - field
+        - value
+
+    InFilter:
+      type: object
+      description: Filter that checks if a field value is in a set of values.
+      properties:
+        field:
+          type: string
+          description: The attribute field name to check.
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttributeValue"
+          description: Set of values to match against.
+      required:
+        - field
+        - values
+
+    Filter:
+      type: object
+      description: |
+        A filter expression. Each filter object must contain exactly one
+        operator key. Filters can be nested using `and` and `or`.
+      properties:
+        eq:
+          $ref: "#/components/schemas/ComparisonFilter"
+        neq:
+          $ref: "#/components/schemas/ComparisonFilter"
+        in:
+          $ref: "#/components/schemas/InFilter"
+        and:
+          type: array
+          items:
+            $ref: "#/components/schemas/Filter"
+          description: Logical AND — all sub-filters must match.
+        or:
+          type: array
+          items:
+            $ref: "#/components/schemas/Filter"
+          description: Logical OR — at least one sub-filter must match.
+
+    SearchRequest:
+      type: object
+      description: Request body for searching nearest neighbors.
+      properties:
+        vector:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Query vector. Must have the same number of dimensions as the collection.
+        k:
+          type: integer
+          format: uint32
+          minimum: 1
+          description: Number of nearest neighbors to return.
+        nprobe:
+          type: integer
+          format: uint32
+          description: Number of posting lists to search. Higher values improve recall at the cost of latency. Optional.
+        filter:
+          $ref: "#/components/schemas/Filter"
+        includeFields:
+          type: array
+          items:
+            type: string
+          description: List of attribute field names to include in results. When omitted, all attributes are returned.
+      required:
+        - vector
+        - k
+
+    SearchResult:
+      type: object
+      description: A single search result with a similarity score and the matched vector.
+      properties:
+        score:
+          type: number
+          format: float
+          description: |
+            Similarity score. For L2 distance, lower scores mean higher
+            similarity. For dot product, higher scores mean higher similarity.
+        vector:
+          $ref: "#/components/schemas/Vector"
+      required:
+        - score
+        - vector
+
+    SearchResponse:
+      type: object
+      description: Response containing search results ranked by similarity.
+      properties:
+        status:
+          type: string
+          example: success
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchResult"
+      required:
+        - status
+        - results
+
+    GetVectorResponse:
+      type: object
+      description: Response containing a single vector retrieved by ID.
+      properties:
+        status:
+          type: string
+          example: success
+        vector:
+          $ref: "#/components/schemas/Vector"
+      required:
+        - status
+        - vector
+
+    ErrorResponse:
+      type: object
+      description: Error response returned for all error cases.
+      properties:
+        status:
+          type: string
+          example: error
+        message:
+          type: string
+          description: Human-readable error message.
+      required:
+        - status
+        - message
