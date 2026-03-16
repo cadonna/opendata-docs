@@ -1,6 +1,38 @@
 ---
 title: Vector
-description: SPANN-style approximate nearest neighbor search on object storage
+description: Approximate nearest neighbor search on object storage
 ---
 
-<Warning>Documentation coming soon.</Warning>
+Vector is a semantic search database built on [SlateDB](https://slatedb.io) and
+object storage. Each database stores documents conforming to a user-defined
+schema. The schema defines fields with various types, along with a "vector" field
+that stores dense vectors with a fixed number of dimensions. Vector serves search
+queries that find the nearst N documents to a given query vector. Because all data
+is durably stored on object storage, a single replica provides full durability
+with no operational overhead for data replication or backups. Writes are limited
+to a single database instance, but queries can be scaled horizontally across
+multiple stateless reader instances.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/vector/quickstart">
+    Install Vector and write your first documents in under five minutes
+  </Card>
+  <Card title="API Reference" icon="code" href="/api-reference/vector-write">
+    Browse the full REST API for writing and searching vectors
+  </Card>
+  <Card title="Data Model" icon="share-nodes" href="/vector/data-model">
+    Understanding Vector's Data Model
+  </Card>
+  <Card title="Configuration" icon="gear" href="/vector/configuration">
+    Vector configuration reference
+  </Card>
+  <Card title="Storage Design" icon="hard-drive" href="/vector/storage-design">
+    How Vector indexes documents to support efficient similarity search
+  </Card>
+  <Card title="Getting to Production" icon="server" href="/vector/production">
+    Deploy, monitor, and secure Vector for production workloads
+  </Card>
+  <Card title="GitHub" icon="github" href="https://github.com/opendata-oss/opendata/tree/main/vector">
+    View the source code, open issues, and contribute
+  </Card>
+</CardGroup>

@@ -69,7 +69,11 @@
         "group": "Vector",
         "icon": "brain",
         "pages": [
-          "vector/index"
+          "vector/index",
+          "vector/quickstart",
+          "vector/data-model",
+          "vector/storage-design",
+          "vector/production"
         ]
       },
       {

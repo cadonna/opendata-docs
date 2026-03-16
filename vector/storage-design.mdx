@@ -1,0 +1,114 @@
+---
+title: Storage Design
+description: How Vector indexes records to support efficient similarity search
+---
+
+Vector stores all records as key-value records in SlateDB. Fields are indexed in
+an inverted index for efficient attribute-based filtering. Vectors are indexed
+for efficient approximate nearest neighbour (ANN) on object storage in a durable
+structure based on [SPFresh](https://arxiv.org/abs/2410.14452).
+
+The vector index associates each vector with one or more of its closest
+"centroids" such that each centroid has a similar small number of associated
+vectors. The vectors assigned to each centroid are tracked in a posting list on
+object storage. The centroids are tracked in a separate structure that supports
+efficiently finding the nearest centroids to a query vector. Currently this
+structure is an in-memory HNSW graph. Search queries find centroids near the
+query vector, then load the associated postings from storage to yield a set of
+candidate results. The candidates are filtered using the attribute indexes and
+then sort-ranked to yield the closest records.
+
+<Note>
+  This page covers the conceptual storage model. For lower level details (
+  compression, quantization, exact byte-level encoding schemas, etc see the
+  [RFCs on
+  GitHub](https://github.com/opendata-oss/opendata/tree/main/vector/rfcs)
+</Note>
+
+## Stored Structures
+
+| Structure          | Purpose                                                                                        |
+| ------------------ | ---------------------------------------------------------------------------------------------- |
+| **Dictionary**     | Maps each record's id to an internal id                                                        |
+| **Forward Index**  | Maps each record's internal id to its attributes                                               |
+| **Inverted Index** | Maps indexed attribute key/value pairs to internal IDs for efficient attribute-based filtering |
+| **Centroids**      | Stores the current set of centroid vectors                                                     |
+| **Postings**       | Maps each centroid to the set of associated vectors                                            |
+
+### Dictionary
+
+The dictionary maps each record to its internal id. Records are written to
+Vector using a user-provided id that can be up to 64 bytes. Vector maps these to
+an internal 64-bit id for efficient storage and stores the mapping in this
+dictionary.
+
+### Forward Index
+
+The forward index maps each record's internal id to the full set of record
+attributes, including the associated vector.
+
+### Inverted Index
+
+The inverted index maps a given attribute key-value pair to the set of internal
+ids of records that match that key-value pair. The set is stored as a bitmap for
+efficient inclusion/exclusion tests and set operations when evaluating
+attribute-based filters.
+
+### Centroids
+
+This is the current set of centroid vectors. When Vector is loaded, it reads the
+set of centroids to build the in-memory graph that enables it to efficiently
+find the closest centroids to a query vector.
+
+### Postings
+
+The postings map each centroid to the set of associated nearby vectors. Each
+posting entry is keyed by the centroid id and stores both the record id and the
+record's vector.
+
+### How a query uses the stored structures
+
+To illustrate how Vector uses the stored structures, lets consider a few
+high-level flows. First, consider a query that searches for 10 records near
+vector `[0.1, 0.2, 0.3]` with attribute filter `department="electronics"`:
+
+1. If not yet loaded, load the centroids and build the in-memory centroid graph.
+1. Search the centroid graph for centroids close to `[0.1, 0.2, 0.3]`.
+1. Load all vectors from postings mapped to the nearby centroids.
+1. Use the inverted index to filter the vectors that match
+   `department="electronics"`.
+1. Compute the distance of each vector to `[0.1, 0.2, 0.3]` and sort-rank these.
+1. Return the 10 closest records
+
+### How the database is maintained on an upsert
+
+Now let's take a look at how the database is maintained on an upsert. Consider
+an upsert of a record with id "calculator", vector `[0.1, 0.2, 0.3]` with an
+attribute `department="electronics"`:
+
+1. Look up "calculator" in the dictionary. If it's present, then mark its
+   existing id as deleted in the forward index, inverted index, and postings.
+1. Assign a new internal id to the record.
+1. Update the dictionary to associate "calculator" with the new internal id.
+1. Write a mapping from the internal id to the record data in the forward index.
+1. Find the nearest centroid(s) and add the new internal id and
+   `[0.1, 0.2, 0.3]` to the postings.
+1. Update the inverted index entry for `department="electronics"` to include the
+   new internal id.
+
+### How the database maintains the vector index
+
+Vector uses an algorithm similar to the one proposed in
+[SPFresh](https://arxiv.org/pdf/2410.14452) to maintain the vector index as
+records are inserted. First, consider the problem with a static vector index
+that maintains a fixed set of centroids. As vectors are upserted, the centroids'
+posting lists will grow larger and increasingly imbalanced. As illustrated
+above, serving a query requires loading multiple posting lists from storage and
+sort-ranking the associated vectors. Therefore query latencies are proportional
+to the size of the searched postings. To keep posting list sizes balanced,
+Vector tracks the size of each centroid's postings. When a centroid grows too
+large, the db triggers a "split" which computes a new set of centroids for the
+posting and reassigns the large centroid's vectors to the new centroids. When a
+centroid becomes too small, the db merges it with a nearby small centroid. This
+allows the db to maintain an efficient ANN index as vectors are upserted and the
+db grows and the shape of the indexed vector space changes.

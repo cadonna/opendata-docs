@@ -1,0 +1,174 @@
+---
+title: Quickstart
+description: Install Vector locally and search your first documents in minutes
+---
+
+Get a vector search database running on your machine in under five minutes.
+You will install Vector, configure a collection, upsert a few records, and
+run a similarity search using curl.
+
+## Install OpenData Vector
+
+Download and install the Vector binary:
+
+```bash
+curl https://www.opendata.dev/install.sh | sh
+```
+
+This places the `opendata-vector` binary in the current directory.
+
+## Configure Vector
+
+Create a file called `vector.yaml` with the following contents:
+
+```yaml vector.yaml
+storage:
+  type: InMemory
+
+flush_interval: 1
+dimensions: 2
+distance_metric: L2
+
+metadata_fields:
+  - name: label
+    field_type: String
+    indexed: true
+```
+
+This configures a collection with:
+
+- **2 dimensions** — each vector has two `f32` components.
+- **L2 distance** — Euclidean distance, where lower scores mean higher
+  similarity.
+- **One indexed field** — a `label` string field you can filter on during
+  search.
+
+## Start the server
+
+Run the binary with the configuration file you just created:
+
+```bash
+./opendata-vector --port 8080 vector --config vector.yaml
+```
+
+Vector starts and is ready to accept requests on port 8080.
+
+## Upsert records
+
+Insert three records with 2-dimensional vectors. Requests use the
+`application/protobuf+json` content type:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/vector/write \
+  -H "Content-Type: application/protobuf+json" \
+  -d '{
+    "upsertVectors": [
+      {
+        "id": "north",
+        "attributes": {
+          "vector": [0.0, 1.0],
+          "label": "north"
+        }
+      },
+      {
+        "id": "east",
+        "attributes": {
+          "vector": [1.0, 0.0],
+          "label": "east"
+        }
+      },
+      {
+        "id": "northeast",
+        "attributes": {
+          "vector": [1.0, 1.0],
+          "label": "northeast"
+        }
+      }
+    ]
+  }'
+```
+
+The server responds with a confirmation:
+
+```json
+{
+  "status": "success",
+  "vectorsUpserted": 3
+}
+```
+
+## Search for nearest neighbors
+
+Search for the 2 closest vectors to `[0.0, 0.9]` — a point near "north":
+
+```bash
+curl -X POST http://localhost:8080/api/v1/vector/search \
+  -H "Content-Type: application/protobuf+json" \
+  -d '{
+    "vector": [0.0, 0.9],
+    "k": 2
+  }'
+```
+
+The response returns the nearest records ranked by L2 distance:
+
+```json
+{
+  "status": "success",
+  "results": [
+    {
+      "score": 0.01,
+      "vector": {
+        "id": "north",
+        "attributes": {
+          "vector": [0.0, 1.0],
+          "label": "north"
+        }
+      }
+    },
+    {
+      "score": 1.01,
+      "vector": {
+        "id": "northeast",
+        "attributes": {
+          "vector": [1.0, 1.0],
+          "label": "northeast"
+        }
+      }
+    }
+  ]
+}
+```
+
+`north` is closest because `[0.0, 1.0]` is only 0.1 away from the query
+`[0.0, 0.9]` in Euclidean distance (score = 0.01 = 0.1²).
+
+## Fetch a record by ID
+
+Retrieve a specific record using its ID:
+
+```bash
+curl http://localhost:8080/api/v1/vector/vectors/east
+```
+
+```json
+{
+  "status": "success",
+  "vector": {
+    "id": "east",
+    "attributes": {
+      "vector": [1.0, 0.0],
+      "label": "east"
+    }
+  }
+}
+```
+
+## Next steps
+
+- To try a more realistic quickstart that indexes a large set of documents
+  using a real embedding model, see the
+  [example on GitHub](https://github.com/opendata-oss/opendata/tree/main/vector/quickstart).
+- Understand how records are structured in [Data Model](/vector/data-model).
+- Learn how the vector index works in [Storage Design](/vector/storage-design).
+- Browse the full REST API in the **API reference** section in the sidebar.
