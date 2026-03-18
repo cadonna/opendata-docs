@@ -1,0 +1,58 @@
+---
+title: Data Model
+description: Collections, records, attributes, and vectors
+---
+
+Each Vector database holds a single collection of records that share a common
+schema and vector properties.
+
+## Collection
+
+A collection is defined by its vector properties and its attribute schema. The
+vector properties — **dimensions** and **distance metric** — are set at creation
+time and are immutable.
+
+| Property            | Description                                              |
+| ------------------- | -------------------------------------------------------- |
+| **Dimensions**      | The number of dimensions for all vectors in the collection. All records must have a vector with exactly this many dimensions. |
+| **Distance metric**  | The metric used to compute similarity between vectors. Either `l2` (Euclidean distance) or `dot_product`. |
+
+## Records
+
+Each record in a collection has:
+
+- A **string ID** — a unique, user-provided identifier up to 64 bytes.
+- A set of **attributes** — typed key-value pairs defined by the collection schema.
+- A **vector** — a special attribute named `vector` that holds a dense vector of `f32` values with the collection's configured number of dimensions.
+
+### Attributes
+
+Attributes are typed fields on a record. Each attribute in the schema has a name,
+a type, and a flag indicating whether it is **indexed**.
+
+| Type        | Description                |
+| ----------- | -------------------------- |
+| **String**  | UTF-8 string               |
+| **Int64**   | 64-bit signed integer      |
+| **Float64** | 64-bit floating point      |
+| **Bool**    | Boolean                    |
+
+#### Indexed vs. non-indexed attributes
+
+An attribute can be marked as **indexed** in the collection schema. Indexed
+attributes are maintained in an inverted index that maps attribute key-value
+pairs to the set of matching records. This enables efficient attribute-based
+filtering during queries — for example, filtering results where
+`category="shoes"`.
+
+Non-indexed attributes are stored with the record but cannot be used in filter
+predicates efficiently. Use non-indexed attributes for data that you want to
+retrieve but don't need to filter on.
+
+### Vector
+
+The `vector` attribute is a reserved field that holds the record's dense
+embedding. It is a vector of `f32` values whose length must exactly match the
+collection's configured dimensions. This is the field used for similarity
+search — queries find the nearest records by comparing their vectors using the
+collection's distance metric.

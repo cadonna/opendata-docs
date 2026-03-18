@@ -69,7 +69,20 @@
         "group": "Vector",
         "icon": "brain",
         "pages": [
-          "vector/index"
+          "vector/index",
+          "vector/quickstart",
+          "vector/data-model",
+          "vector/storage-design",
+          "vector/production",
+          {
+            "group": "API reference",
+            "openapi": "openapi/vector.yaml",
+            "pages": [
+              "POST /api/v1/vector/write",
+              "POST /api/v1/vector/search",
+              "GET /api/v1/vector/vectors/{id}"
+            ]
+          }
         ]
       },
       {

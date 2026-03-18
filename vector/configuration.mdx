@@ -1,0 +1,290 @@
+---
+title: Configuration
+description: Configure Vector
+---
+
+Vector is configured through CLI arguments and a YAML configuration file. The CLI
+arguments control server startup and mode, while the YAML file defines storage,
+vector properties, indexing parameters, and metadata schema.
+
+## CLI Arguments
+
+Pass these flags when starting the `opendata-vector` binary. The binary has two
+subcommands: `vector` (read-write) and `reader` (read-only).
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--port` | `8080` | HTTP server port |
+| `--config` | _none_ | Path to the YAML configuration file |
+
+```bash
+# Read-write mode
+./opendata-vector --port 8080 vector --config vector.yaml
+
+# Read-only mode
+./opendata-vector --port 8080 reader --config reader.yaml
+```
+
+## Configuration File
+
+The configuration file is YAML. The generic placeholders used in this reference are:
+
+- `<string>`: a regular string
+- `<int>`: an integer value
+- `<float>`: a floating-point value
+- `<bool>`: `true` or `false`
+
+A value enclosed in `[ ]` is optional. The default value is shown after `| default =`.
+
+### Read-Write Configuration
+
+```yaml
+# Storage backend configuration (required).
+storage:
+  <storage_config>
+
+# Number of dimensions for all vectors (required, immutable after creation).
+# Common values: 384 (MiniLM), 768 (BERT), 1536 (OpenAI).
+dimensions: <int>
+
+# Distance metric for similarity computation (immutable after creation).
+[ distance_metric: <string> | default = L2 ] # One of: L2, DotProduct
+
+# How often (in seconds) to flush data from memory to durable storage.
+[ flush_interval: <int> | default = 60 ]
+
+# Number of vectors in a centroid posting list that triggers a split.
+[ split_threshold_vectors: <int> | default = 200 ]
+
+# Number of vectors below which a centroid posting list triggers a merge.
+[ merge_threshold_vectors: <int> | default = 50 ]
+
+# Maximum concurrent rebalance tasks.
+[ max_rebalance_tasks: <int> | default = 8 ]
+
+# Metadata field schema. If empty, any attribute names are accepted with
+# types inferred from the first write.
+[ metadata_fields:
+    [ - <metadata_field_spec> ... ] ]
+```
+
+### Read-Only Configuration
+
+The reader configuration is a subset — it omits all write-specific fields
+(flush interval, split/merge thresholds, rebalancing, chunk target).
+
+```yaml
+storage:
+  <storage_config>
+
+dimensions: <int>
+
+[ distance_metric: <string> | default = L2 ]
+
+[ metadata_fields:
+    [ - <metadata_field_spec> ... ] ]
+```
+
+### `<storage_config>`
+
+Storage is tagged by `type`.
+
+```yaml
+# The storage backend type.
+type: <string> # One of: InMemory, SlateDb
+```
+
+<Tabs>
+  <Tab title="InMemory">
+    Stores data in memory only. Data is lost on restart. Useful for testing
+    and development. No additional fields are required.
+
+    ```yaml
+    storage:
+      type: InMemory
+    ```
+  </Tab>
+  <Tab title="SlateDb">
+    Persists data to an object store via [SlateDB](https://slatedb.io).
+
+    ```yaml
+    storage:
+      type: SlateDb
+
+      # Path prefix for SlateDB data within the object store.
+      [ path: <string> | default = "data" ]
+
+      # Path to a SlateDB settings file (TOML/YAML/JSON).
+      # If omitted, SlateDB checks for SlateDb.toml, SlateDb.json, or SlateDb.yaml
+      # in the working directory and merges any SLATEDB_-prefixed environment variables.
+      [ settings_path: <string> ]
+
+      # Object store provider configuration (required).
+      object_store:
+        <object_store_config>
+
+      # Optional two-tier block cache for SST block lookups.
+      [ block_cache:
+          <block_cache_config> ]
+    ```
+  </Tab>
+</Tabs>
+
+### `<object_store_config>`
+
+The object store is tagged by `type`.
+
+<Tabs>
+  <Tab title="Local filesystem">
+    ```yaml
+    object_store:
+      type: Local
+      # Directory path for local storage.
+      path: <string>
+    ```
+  </Tab>
+  <Tab title="AWS S3">
+    ```yaml
+    object_store:
+      type: Aws
+      # AWS region (e.g. us-west-2).
+      region: <string>
+      # S3 bucket name.
+      bucket: <string>
+    ```
+  </Tab>
+  <Tab title="In-memory">
+    ```yaml
+    object_store:
+      type: InMemory
+    ```
+  </Tab>
+</Tabs>
+
+### `<block_cache_config>`
+
+The block cache reduces object store reads by caching hot SST blocks in memory
+and on local disk. Tagged by `type`.
+
+```yaml
+block_cache:
+  type: FoyerHybrid
+  # In-memory cache capacity in bytes.
+  memory_capacity: <int>
+  # On-disk cache capacity in bytes.
+  disk_capacity: <int>
+  # Path for the on-disk cache directory (ideally NVMe).
+  disk_path: <string>
+```
+
+### `<metadata_field_spec>`
+
+Defines the schema for metadata attributes attached to vectors. When a schema is
+defined, writes with unknown attribute names or type mismatches will be rejected.
+
+```yaml
+# Field name (must be unique).
+name: <string>
+
+# Value type. One of: String, Int64, Float64, Bool
+field_type: <string>
+
+# Whether this field is indexed for query filtering.
+indexed: <bool>
+```
+
+Schema evolution rules:
+- New fields can be added
+- Indexing can be enabled on existing fields
+- Fields cannot be removed, and types cannot be changed
+
+## Distance Metrics
+
+| Metric | Formula | Similarity |
+| --- | --- | --- |
+| `L2` | `sqrt(sum((a[i] - b[i])²))` | Lower scores = more similar |
+| `DotProduct` | `sum(a[i] * b[i])` | Higher scores = more similar |
+
+## Examples
+
+<Tabs>
+  <Tab title="Local development">
+    ```yaml vector.yaml
+    storage:
+      type: SlateDb
+      path: data
+      object_store:
+        type: Local
+        path: ./data
+
+    dimensions: 384
+    distance_metric: L2
+    flush_interval: 5
+
+    metadata_fields:
+      - name: category
+        field_type: String
+        indexed: true
+    ```
+  </Tab>
+  <Tab title="Production (S3)">
+    ```yaml vector.yaml
+    storage:
+      type: SlateDb
+      path: vector-data
+      object_store:
+        type: Aws
+        region: us-west-2
+        bucket: my-vector-bucket
+
+    dimensions: 1536
+    distance_metric: DotProduct
+    flush_interval: 10
+
+    metadata_fields:
+      - name: category
+        field_type: String
+        indexed: true
+      - name: price
+        field_type: Float64
+        indexed: true
+      - name: in_stock
+        field_type: Bool
+        indexed: true
+      - name: description
+        field_type: String
+        indexed: false
+    ```
+  </Tab>
+  <Tab title="Testing (in-memory)">
+    ```yaml vector.yaml
+    storage:
+      type: InMemory
+
+    dimensions: 384
+    distance_metric: L2
+    ```
+  </Tab>
+  <Tab title="Read-only replica">
+    ```yaml reader.yaml
+    storage:
+      type: SlateDb
+      path: vector-data
+      object_store:
+        type: Aws
+        region: us-west-2
+        bucket: my-vector-bucket
+
+    dimensions: 1536
+    distance_metric: DotProduct
+
+    metadata_fields:
+      - name: category
+        field_type: String
+        indexed: true
+      - name: price
+        field_type: Float64
+        indexed: true
+    ```
+  </Tab>
+</Tabs>
