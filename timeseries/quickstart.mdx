@@ -106,11 +106,12 @@ Download the latest release for your platform from the
 extract it, and start it:
 
 ```bash
-tar -xzf node_exporter-*.tar.gz && rm node_exporter-*.tar.gz
+tar xvfz node_exporter-*.tar.gz && rm node_exporter-*.tar.gz
 cd node_exporter-*
 
-# on macOS you might need to execute `xattr -d com.apple.quarantine ./node_exporter` 
-# before the next line to avoid macOS blocking the binary
+# on macOS you might need the next line to avoid macOS blocking the execution of the binary
+xattr -d com.apple.quarantine ./node_exporter
+
 ./node_exporter
 ```
 
