@@ -1,0 +1,155 @@
+---
+title: Ingest
+description: Something
+---
+
+OpenData Ingest is a simple data integration system that leverages object storage to reliably ingest data into an
+OpenData database without a stateful broker.
+Instead data sources write directly to object storage and databases read the data directly from object storage.
+A manifest in object storage coordinates the reads and writes using queue semantics.
+
+## Architecture
+
+<pre className="ascii-art">{`
+╔═Ingestors══════════════════════════════════════════════════╗
+║                                                            ║░
+║  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  ║░
+║  │  Ingestor 1  │    │  Ingestor 2  │    │  Ingestor N  │  ║░
+║  │  q-producer  │    │  q-producer  │    │  q-producer  │  ║░
+║  └───────┬──────┘    └──────────────┘    └───────┬──────┘  ║░
+║          │                                       │         ║░
+╚══════════╪═══════════════════════════════════════╪═════════╝░
+ ░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░
+           └flush                            enqueue
+                │                             │
+╔═Object Store Bucket═════════════════════════╪══════════════╗
+║               │                             │              ║░
+║               │                             │              ║░
+║  ┏━data━━━━━━━▼━━━━━━━━━━━┓     ┏━queue━━━━━▼━━━━━━━━━━┓   ║░
+║  ┃                        ┃     ┃                      ┃   ║░
+║  ┃                        ┃     ┃  ╔════════════════╗  ┃   ║░
+║  ┃ 01J5T4R3.batch         ┃     ┃  ║                ║  ┃   ║░
+║  ┃ 01J5T4R7.batch         ┃     ┃  ║   q-manifest   ║  ┃   ║░
+║  ┃ 01J5T4RB.batch         ┃     ┃  ║                ║  ┃   ║░
+║  ┃                        ┃     ┃  ╚════════════════╝  ┃   ║░
+║  ┃                        ┃     ┃                      ┃   ║░
+║  ┃                        ┃     ┃                      ┃   ║░
+║  ┗━━━━━━━━━━━━┬━━━━━━━━━━━┛     ┗━━━━━━━━━━━▲━━━━━━━━━━┛   ║░
+║               │                             │              ║░
+║               │                             │              ║░
+╚═══════════════╪═════════════════════════════╪══════════════╝░
+ ░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░
+                │        ┌───────poll─────────┘
+              read       │
+                │        │
+       ╔═Writer═╪════════╪═════════╗
+       ║        │        │         ║░
+       ║        │┌───────┴──────┐  ║░     ╔════════════════╗
+       ║        ││  Collector   │  ║░     ║                ║
+       ║        └▶  q-consumer  ├──write──▶    Database    ║
+       ║         └──────────────┘  ║░     ║                ║
+       ║                           ║░     ╚════════════════╝
+       ╚═══════════════════════════╝░
+        ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+`}</pre>
+
+OpenData Ingest has two main components: **multiple Ingestors** and **one Collector**.
+Ingestors communicate with the Collector through a queue on object storage.
+
+### Ingestors
+
+Ingestors accept arbitrary byte entries from callers, buffer them in memory, and periodically flush them as
+binary data batches to object storage. Each ingestor exposes a minimal API:
+
+```rust
+pub async fn ingest(
+	&self,
+	entries: Vec<Bytes>,
+	metadata: Bytes
+) -> Result<WriteHandle>
+```
+
+Ingestors buffer incoming entries in memory and flush them to object storage as data batches.
+Flushes are triggered either by elapsed time (default: 100ms) or by batch size (default: 64 MiB).
+Data batches are binary and optionally compressed.
+Each file is named with a [ULID](https://github.com/ulid/spec), which encodes a millisecond-precision timestamp.
+Once a data batch is flushed to object storage, ingestors append the location of the batch together with its metadata
+to a queue.
+
+(ToDo: add image for queue)
+
+The queue is a single binary manifest in object storage that tracks the locations and metadata of data batches.
+Queue entries are kept in append order.
+Internally, ingestors use a queue producer for interacting with the queue.
+To ensure that ingestors do not overwrite each other’s queue entries, queue producers use compare-and-swap (CAS)
+writes when appending to the queue.
+That means, that an append to the queue only succeeds if the manifest has not been modified since it was read by
+the queue producer.
+If the manifest was modified in the meanwhile, the producer re-reads the manifest and tries writing it again with
+the new entries.
+
+The queue manifest format was designed for append efficiency.
+Existing entries are never deserialized during append.
+Thus, appending an entry to the queue does not depend on the length of the queue, i.e., the runtime complexity is O(1).
+
+The `WriteHandle` returned by `ingest()` contains a `DurabilityWatcher`.
+Callers can `await_durable()` on the `DurabilityWatcher` to block until the entries have been safely persisted to
+object storage and enqueued in the manifest.
+This allows to track the progress of ingestion with durability guarantees.
+Note that the durability only refers to the data batch and not to the database write.
+In other words, the `DurabilityWatcher` allows you to avoid data loss during failover, but it does not allow you to
+implement read-your-own-writes consistency.
+
+### Collector
+
+The collector is the read-side counterpart to the ingestors.
+The collector is an iterator over the ingested data batches in object storage.
+It delivers the batches to the database in the order recorded in the queue.
+The collector exposes an API for fetching the next data batch and for acknowledging full processing of a data batch:
+
+```rust
+pub async fn next_batch(&mut self) -> Result<Option<CollectedBatch>>
+pub async fn ack(&mut self, sequence: u64) -> Result<()>
+```
+
+A call to `next_batch()` reads the next location in the queue manifest, fetches the data batch from object storage,
+and returns the data, the metadata, and the location to the caller.
+Additionally, each entry in the queue manifest has a unique sequence number which is also returned by `next_batch()`.
+
+The sequence number is automatically assigned by the queue producer at ingestion time.
+Sequence numbers are assigned in increasing order without gaps.
+The sequence number is used for acknowledging the processing of a data batch and for tracking the progress.
+Acknowledging must be in order — acknowledging a sequence number that is not immediately after the last acked
+sequence number is not allowed.
+This ensures that no data batch is missed.
+
+While multiple ingestors can write to a single queue manifest, only one collector can read from a single queue manifest.
+This is not a limitation in OpenData since OpenData databases employ a single writer paradigm.
+A single collector prevents that zombie collectors originating from infrastructure failures acknowledge data batches
+and make them unavailable to the collector in charge.
+To ensure a single collector, the queue manifest gates reads with an epoch.
+A attempt to read with an epoch that is different from the one stored in the manifest results in an error.
+Specifically, when a collector is created, it reads the epoch from the queue manifest, increases it, and writes it back
+to the queue manifest.
+When the collector becomes a zombie and a new collector is started, the zombie collector does not have the right epoch
+anymore and gets fenced.
+
+As ingestors use queue producers internally to write to the queue manifest, the collector uses a queue consumer to read
+from the queue manifest that takes care of the epoch-based reading.
+Furthermore, the queue consumer provides functionality to dequeue entries from the queue avoiding unbounded growth.
+
+The collector is responsible for cleaning up processed data batches.
+At creation time of the collector and every 100 acknowledged data batches,
+all entries of acknowledged data batches are dequeued from the queue manifest.
+Additionally, a dedicated garbage collector task is responsible for deleting the data batches of the dequeued queue
+entries in object storage.
+
+The collector API provides the means for implementing the exactly-once delivery guarantee.
+To achieve exactly-once, the writer needs to atomically write the data and the sequence number returned
+from `next_batch()`  to the database.
+If the atomic write succeeds, but a failure happens before the call to `ack()` returns, the new writer can read the
+sequence number from the database and use it to initialize the collector to the queue entry right after that
+sequence number.
+Since the new collector will also increase the epoch of the queue manifest,
+the old collector will be fenced and cannot read from the queue.
+No duplicates will be written to the database.

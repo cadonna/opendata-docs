@@ -92,6 +92,13 @@
         "pages": [
           "keyvalue/index"
         ]
+      },
+      {
+        "group": "Ingest",
+        "icon": "key",
+        "pages": [
+          "ingest/index"
+        ]
       }
     ]
   },
