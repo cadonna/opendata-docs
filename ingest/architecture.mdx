@@ -1,0 +1,161 @@
+---
+title: Architecture
+description: How Ingest works
+---
+
+Ingest is a library with two main components: **multiple ingestors** and **a single
+collector**. Ingestors and the collector communicate exclusively through a
+queue manifest in object storage — there is no direct network path between
+them and no stateful broker to operate.
+
+<pre className="ascii-art">{`
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒ ingest architecture ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒┃
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃                                                                       ┃
+┃    ╔═Ingestors══════════════════════════════════════════════════╗     ┃
+┃    ║                                                            ║░    ┃
+┃    ║  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  ║░    ┃
+┃    ║  │  Ingestor 1  │    │  Ingestor 2  │    │  Ingestor N  │  ║░    ┃
+┃    ║  │  q-producer  │    │  q-producer  │    │  q-producer  │  ║░    ┃
+┃    ║  └───────┬──────┘    └──────────────┘    └───────┬──────┘  ║░    ┃
+┃    ║          │                                       │         ║░    ┃
+┃    ╚══════════╪═══════════════════════════════════════╪═════════╝░    ┃
+┃     ░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░    ┃
+┃               └flush                            enqueue               ┃
+┃                    │                             │                    ┃
+┃    ╔═Object Store Bucket═════════════════════════╪══════════════╗     ┃
+┃    ║               │                             │              ║░    ┃
+┃    ║               │                             │              ║░    ┃
+┃    ║  ┏━data━━━━━━━▼━━━━━━━━━━━┓     ┏━queue━━━━━▼━━━━━━━━━━┓   ║░    ┃
+┃    ║  ┃                        ┃     ┃                      ┃   ║░    ┃
+┃    ║  ┃                        ┃     ┃  ╔════════════════╗  ┃   ║░    ┃
+┃    ║  ┃ 01J5T4R3.batch         ┃     ┃  ║                ║  ┃   ║░    ┃
+┃    ║  ┃ 01J5T4R7.batch         ┃     ┃  ║   q-manifest   ║  ┃   ║░    ┃
+┃    ║  ┃ 01J5T4RB.batch         ┃     ┃  ║                ║  ┃   ║░    ┃
+┃    ║  ┃                        ┃     ┃  ╚════════════════╝  ┃   ║░    ┃
+┃    ║  ┃                        ┃     ┃                      ┃   ║░    ┃
+┃    ║  ┃                        ┃     ┃                      ┃   ║░    ┃
+┃    ║  ┗━━━━━━━━━━━━┬━━━━━━━━━━━┛     ┗━━━━━━━━━━━▲━━━━━━━━━━┛   ║░    ┃
+┃    ║               │                             │              ║░    ┃
+┃    ║               │                             │              ║░    ┃
+┃    ╚═══════════════╪═════════════════════════════╪══════════════╝░    ┃
+┃     ░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░    ┃
+┃                    │        ┌───────poll─────────┘                    ┃
+┃                  read       │                                         ┃
+┃                    │        │                                         ┃
+┃           ╔═Writer═╪════════╪═════════╗                               ┃
+┃           ║        │        │         ║░                              ┃
+┃           ║        │┌───────┴──────┐  ║░     ╔════════════════╗       ┃
+┃           ║        ││  Collector   │  ║░     ║                ║       ┃
+┃           ║        └▶  q-consumer  ├──write──▶    Database    ║       ┃
+┃           ║         └──────────────┘  ║░     ║                ║       ┃
+┃           ║                           ║░     ╚════════════════╝       ┃
+┃           ╚═══════════════════════════╝░                              ┃
+┃            ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░                              ┃
+┃                                                                       ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+`}</pre>
+
+## Ingestors
+
+Ingestors accept arbitrary byte entries from callers, buffer them in
+memory, and periodically flush them as binary data batches to object
+storage. Each ingestor exposes a minimal API:
+
+```rust
+pub async fn ingest(
+    &self,
+    entries: Vec<Bytes>,
+    metadata: Bytes,
+) -> Result<WriteHandle>
+```
+
+Flushes are triggered either by elapsed time (default: 100 ms) or by batch
+size (default: 64 MiB). Data batches are binary and optionally compressed.
+Each batch is named with a [ULID](https://github.com/ulid/spec), which
+encodes a millisecond-precision timestamp. Once a batch is flushed,
+ingestors append its location and metadata to the queue.
+
+The queue is a single binary manifest in object storage that tracks the
+locations and metadata of data batches in append order. Ingestors interact
+with it through a queue producer, which uses compare-and-swap (CAS) writes
+to ensure that concurrent ingestors do not overwrite each other's entries:
+an append succeeds only if the manifest has not been modified since it was
+read. On conflict, the producer re-reads the manifest and retries.
+Additionally, the queue producer assigns consecutive sequence numbers to
+queue entries.
+
+<pre className="ascii-art">{`
+  ╔═queue manifest═══════════════════════════════════════════╗
+  ║                                                          ║░
+  ║  seq │       location        │     metadata              ║░
+  ║ ─────┼───────────────────────┼─────────────────          ║░
+  ║  001 │ ingest/01J5T4R3.batch │ src=app-1 n=128           ║░
+  ║  002 │ ingest/01J5T4R7.batch │ src=app-2 n=64            ║░
+  ║  003 │ ingest/01J5T4RB.batch │ src=app-1 n=256           ║░
+  ║  004 │ ingest/01J5T4RF.batch │ src=app-3 n=192           ║░
+  ║  005 │ ingest/01J5T4RJ.batch │ src=app-2 n=512           ║░
+  ║   …  │          …            │        …                  ║░
+  ║                                                          ║░
+  ╚══════════════════════════════════════════════════════════╝░
+   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+`}</pre>
+
+The manifest format is designed for append efficiency. Existing entries
+are never deserialized during append, so appending a new entry is O(1) in
+the length of the queue.
+
+The `WriteHandle` returned by `ingest()` contains a `DurabilityWatcher`.
+Callers can `await_durable()` to block until the entries have been
+persisted to object storage and enqueued in the manifest. This avoids data
+loss during failover, but it does not provide read-your-own-writes
+consistency — durability refers to the data batch, not to the database
+write.
+
+## Collector
+
+The collector is the read-side counterpart to the ingestors. It iterates
+over ingested data batches in object storage and delivers them to the
+database in the order recorded in the queue:
+
+```rust
+pub async fn next_batch(&mut self) -> Result<Option<CollectedBatch>>
+pub async fn ack(&mut self, sequence: u64) -> Result<()>
+```
+
+A call to `next_batch()` reads the next location in the queue manifest,
+fetches the data batch from object storage, and returns the data,
+metadata, and a unique sequence number to the caller. Sequence numbers
+are assigned by the queue producer at ingestion time in increasing order
+without gaps, and they are used both for acknowledgement and for tracking
+progress. Acknowledgements must be in order: acknowledging a sequence
+number that is not immediately after the last one is rejected, ensuring
+that no batch is silently skipped.
+
+While multiple ingestors can write to a queue manifest, only one collector
+can read from it. This matches OpenData's single-writer paradigm and
+prevents zombie collectors — surviving after an infrastructure failure —
+from acknowledging batches and making them invisible to the active
+collector. Single-collector exclusivity is enforced by an epoch stored in
+the queue manifest: when a collector starts, it reads the epoch,
+increments it, and writes it back. Reads with a stale epoch are rejected,
+so any zombie collector is fenced as soon as a new one takes over.
+
+The collector is also responsible for cleaning up processed data batches.
+At startup and every 100 acknowledged batches, all entries for
+acknowledged batches are dequeued from the manifest. A dedicated garbage
+collector task then deletes the corresponding data batches from object
+storage.
+
+The collector API supports exactly-once delivery. To achieve it, the
+writer atomically persists the batch data and the sequence number from
+`next_batch()` to the database. If the atomic write succeeds but a failure
+occurs before `ack()` returns, a new writer can read the last persisted
+sequence number from the database and initialize the collector to resume
+right after it. The new collector also bumps the epoch, fencing the old
+one and preventing any duplicate writes.
+
+## Usage example
+
+For example how Ingest can be integrated into an ingestion pipeline see [ingest into Timeseries](/timeseries/ingest).

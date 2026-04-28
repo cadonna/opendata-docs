@@ -92,6 +92,15 @@
         "pages": [
           "keyvalue/index"
         ]
+      },
+      {
+        "group": "Ingest",
+        "icon": "right-to-bracket",
+        "pages": [
+          "ingest/index",
+          "ingest/architecture",
+          "ingest/configuration"
+        ]
       }
     ]
   },
