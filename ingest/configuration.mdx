@@ -1,0 +1,234 @@
+---
+title: Configuration
+description: Configure object storage, batching, and garbage collection for Ingest
+---
+
+Ingest is a Rust library. Configuration is expressed as plain Rust structs
+that the host service constructs and hands to the `Ingestor` and
+`Collector` APIs. Two top-level structs govern the write and read sides:
+`IngestorConfig` and `CollectorConfig`. Both share the same
+`ObjectStoreConfig` from the `common` crate.
+
+The structs derive `Serialize`/`Deserialize` so host services *may* embed
+them in their own config formats, but the canonical surface documented
+here is the Rust API.
+
+## `IngestorConfig`
+
+Controls where data batches and the queue manifest are written, how often
+batches are flushed, and when backpressure is applied.
+
+```rust
+pub struct IngestorConfig {
+    /// Object store provider. Determines where data batches and the
+    /// queue manifest are persisted.
+    pub object_store: ObjectStoreConfig,
+
+    /// Path prefix for data batch objects in object storage.
+    /// Default: "ingest"
+    pub data_path_prefix: String,
+
+    /// Path to the queue manifest in object storage.
+    /// Default: "ingest/manifest"
+    pub manifest_path: String,
+
+    /// Flush the in-memory batch when this much time has elapsed since
+    /// the last flush.
+    /// Default: 100 ms
+    pub flush_interval: Duration,
+
+    /// Flush the in-memory batch when its total size in bytes (entries
+    /// plus metadata) exceeds this threshold.
+    /// Default: 64 MiB (67_108_864)
+    pub flush_size_bytes: usize,
+
+    /// Maximum number of input entry vectors that may be buffered for
+    /// the background batch writer before backpressure is applied to
+    /// callers.
+    /// Default: 1000
+    pub max_buffered_inputs: usize,
+
+    /// Compression algorithm applied to the record block of each data
+    /// batch.
+    /// Default: CompressionType::None
+    pub batch_compression: CompressionType,
+}
+```
+
+## `CollectorConfig`
+
+Controls where the queue manifest and data batches are read from, and
+how stale batches are garbage collected.
+
+```rust
+pub struct CollectorConfig {
+    /// Object store provider. Must point at the same bucket or directory
+    /// as the paired ingestor.
+    pub object_store: ObjectStoreConfig,
+
+    /// Path to the queue manifest in object storage. Must match the
+    /// ingestor's `manifest_path`.
+    /// Default: "ingest/manifest"
+    pub manifest_path: String,
+
+    /// Path prefix for data batch objects. Must match the ingestor's
+    /// `data_path_prefix`.
+    /// Default: "ingest"
+    pub data_path_prefix: String,
+
+    /// How often the garbage collector runs.
+    /// Default: 5 minutes
+    pub gc_interval: Duration,
+
+    /// Minimum age of an unreferenced batch file before it is eligible
+    /// for deletion by the garbage collector.
+    /// Default: 10 minutes
+    pub gc_grace_period: Duration,
+}
+```
+
+The grace period prevents the collector from deleting batches that an
+ingestor has just written but not yet enqueued in the manifest.
+
+## `ObjectStoreConfig`
+
+A tagged enum re-exported from the `common` crate. Three variants are
+available:
+
+<Tabs>
+  <Tab title="Local filesystem">
+    ```rust
+    ObjectStoreConfig::Local(LocalObjectStoreConfig {
+        path: "./data".to_string(),
+    })
+    ```
+  </Tab>
+  <Tab title="AWS S3">
+    ```rust
+    ObjectStoreConfig::Aws(AwsObjectStoreConfig {
+        region: "us-west-2".to_string(),
+        bucket: "my-ingest-bucket".to_string(),
+    })
+    ```
+  </Tab>
+  <Tab title="In-memory">
+    ```rust
+    ObjectStoreConfig::InMemory
+    ```
+  </Tab>
+</Tabs>
+
+## `CompressionType`
+
+```rust
+pub enum CompressionType {
+    /// No compression (default).
+    None,
+    /// Zstandard compression of the record block.
+    Zstd,
+}
+```
+
+## Pairing Ingestors and Collectors
+
+An ingestor and the collector that drains it must agree on three values:
+
+- **`object_store`** must point at the same bucket or directory.
+- **`manifest_path`** must be identical, since it identifies the queue.
+- **`data_path_prefix`** must be identical, since the manifest stores
+  batch locations relative to it.
+
+A mismatch on any of these silently routes traffic to a different queue
+or causes the collector to fail to fetch batches it sees in the manifest.
+
+## Examples
+
+<Tabs>
+  <Tab title="Local development">
+    ```rust
+    use std::time::Duration;
+    use common::{ObjectStoreConfig, LocalObjectStoreConfig};
+    use ingest::{IngestorConfig, CollectorConfig};
+    use ingest::model::CompressionType;
+
+    let object_store = ObjectStoreConfig::Local(LocalObjectStoreConfig {
+        path: "./data".to_string(),
+    });
+
+    let ingestor_config = IngestorConfig {
+        object_store: object_store.clone(),
+        data_path_prefix: "ingest".to_string(),
+        manifest_path: "ingest/manifest".to_string(),
+        flush_interval: Duration::from_millis(100),
+        flush_size_bytes: 64 * 1024 * 1024,
+        max_buffered_inputs: 1000,
+        batch_compression: CompressionType::None,
+    };
+
+    let collector_config = CollectorConfig {
+        object_store,
+        manifest_path: "ingest/manifest".to_string(),
+        data_path_prefix: "ingest".to_string(),
+        gc_interval: Duration::from_secs(5 * 60),
+        gc_grace_period: Duration::from_secs(10 * 60),
+    };
+    ```
+  </Tab>
+  <Tab title="Production (S3)">
+    ```rust
+    use std::time::Duration;
+    use common::{ObjectStoreConfig, AwsObjectStoreConfig};
+    use ingest::{IngestorConfig, CollectorConfig};
+    use ingest::model::CompressionType;
+
+    let object_store = ObjectStoreConfig::Aws(AwsObjectStoreConfig {
+        region: "us-west-2".to_string(),
+        bucket: "my-ingest-bucket".to_string(),
+    });
+
+    let ingestor_config = IngestorConfig {
+        object_store: object_store.clone(),
+        data_path_prefix: "ingest".to_string(),
+        manifest_path: "ingest/manifest".to_string(),
+        flush_interval: Duration::from_millis(200),
+        flush_size_bytes: 128 * 1024 * 1024,
+        max_buffered_inputs: 1000,
+        batch_compression: CompressionType::Zstd,
+    };
+
+    let collector_config = CollectorConfig {
+        object_store,
+        manifest_path: "ingest/manifest".to_string(),
+        data_path_prefix: "ingest".to_string(),
+        gc_interval: Duration::from_secs(5 * 60),
+        gc_grace_period: Duration::from_secs(10 * 60),
+    };
+    ```
+  </Tab>
+  <Tab title="Testing (in-memory)">
+    ```rust
+    use std::time::Duration;
+    use common::ObjectStoreConfig;
+    use ingest::{IngestorConfig, CollectorConfig};
+    use ingest::model::CompressionType;
+
+    let ingestor_config = IngestorConfig {
+        object_store: ObjectStoreConfig::InMemory,
+        data_path_prefix: "ingest".to_string(),
+        manifest_path: "ingest/manifest".to_string(),
+        flush_interval: Duration::from_millis(100),
+        flush_size_bytes: 64 * 1024 * 1024,
+        max_buffered_inputs: 1000,
+        batch_compression: CompressionType::None,
+    };
+
+    let collector_config = CollectorConfig {
+        object_store: ObjectStoreConfig::InMemory,
+        manifest_path: "ingest/manifest".to_string(),
+        data_path_prefix: "ingest".to_string(),
+        gc_interval: Duration::from_secs(5 * 60),
+        gc_grace_period: Duration::from_secs(10 * 60),
+    };
+    ```
+  </Tab>
+</Tabs>

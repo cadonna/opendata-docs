@@ -95,9 +95,11 @@
       },
       {
         "group": "Ingest",
-        "icon": "key",
+        "icon": "right-to-bracket",
         "pages": [
-          "ingest/index"
+          "ingest/index",
+          "ingest/architecture",
+          "ingest/configuration"
         ]
       }
     ]
