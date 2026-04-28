@@ -3,7 +3,7 @@ title: Architecture
 description: How Ingest works
 ---
 
-Ingest has two main components: **multiple ingestors** and **a single
+Ingest is a library with two main components: **multiple ingestors** and **a single
 collector**. Ingestors and the collector communicate exclusively through a
 queue manifest in object storage — there is no direct network path between
 them and no stateful broker to operate.
@@ -77,14 +77,30 @@ Each batch is named with a [ULID](https://github.com/ulid/spec), which
 encodes a millisecond-precision timestamp. Once a batch is flushed,
 ingestors append its location and metadata to the queue.
 
-(ToDo: add image for queue)
-
 The queue is a single binary manifest in object storage that tracks the
 locations and metadata of data batches in append order. Ingestors interact
 with it through a queue producer, which uses compare-and-swap (CAS) writes
 to ensure that concurrent ingestors do not overwrite each other's entries:
 an append succeeds only if the manifest has not been modified since it was
 read. On conflict, the producer re-reads the manifest and retries.
+Additionally, the queue producer assigns consecutive sequence numbers to
+queue entries.
+
+<pre className="ascii-art">{`
+  ╔═queue manifest═══════════════════════════════════════════╗
+  ║                                                          ║░
+  ║  seq │       location        │     metadata              ║░
+  ║ ─────┼───────────────────────┼─────────────────          ║░
+  ║  001 │ ingest/01J5T4R3.batch │ src=app-1 n=128           ║░
+  ║  002 │ ingest/01J5T4R7.batch │ src=app-2 n=64            ║░
+  ║  003 │ ingest/01J5T4RB.batch │ src=app-1 n=256           ║░
+  ║  004 │ ingest/01J5T4RF.batch │ src=app-3 n=192           ║░
+  ║  005 │ ingest/01J5T4RJ.batch │ src=app-2 n=512           ║░
+  ║   …  │          …            │        …                  ║░
+  ║                                                          ║░
+  ╚══════════════════════════════════════════════════════════╝░
+   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+`}</pre>
 
 The manifest format is designed for append efficiency. Existing entries
 are never deserialized during append, so appending a new entry is O(1) in
